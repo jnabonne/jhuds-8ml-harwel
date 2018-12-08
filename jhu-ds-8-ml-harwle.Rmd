@@ -1,0 +1,140 @@
+---
+title: 'HAR: Building Models to evaluate your exercices performance'
+author: "jnabonne"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+ref: '[jhu-ds-8-ml]HARWLE'
+geometry: left=3cm,right=2.5cm,top=2cm,bottom=2cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache=FALSE, warning=FALSE, message=FALSE)
+library(caret) ; library(parallel) ; library(doParallel)
+set.seed(71431)
+```
+
+---
+
+# Executive Summary
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+This study try to answer this using data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the WLE section of the [website](http:/groupware.les.inf.puc-rio.br/har) form which comes the datasets.
+
+Models have been trained and compared (using cross-validation).  
+The best one, random forest, ended-up having excellent result with over 99% accuracy _(out-of-sample error << 1%)_.
+
+### Notes and Sources
+The dataset files [pml-training.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [pml-testing.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) have already been downloaded.
+
+In order to boost caret training processes (especially for decision tree and radom forest), parallel computing is used following instructions found through the forum on [github](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md)
+
+Sources: _Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises._  
+_Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013._
+
+
+---
+
+# Exploratory Analysis
+
+As with any new dataset, after loading them, the first thing we do is to discover/study them...
+```{r data-load-check}
+training_set <- read.csv("./pml-training.csv", header=TRUE, na.strings=c('NA','',' '))
+#str(training_set) ; summary(training$classe)  # commented to save space
+```
+I have renamed 'pml-testing.csv' in 'validation' as we will be using cross-validation; it will be used to validate our best model later.
+
+It appears that quite a lot of variables are filled with NA or irrevelant to our case (username, timestamp and windows) and that outcome label differs between the 2 datasets. Let's correct that...
+```{r cleaning-dataset}
+idx_na <-colSums(is.na(training_set)) > .55*dim(training_set)[1]  # catch mostly (>55%) NAs variables
+training_set <- training_set[!(idx_na)]       # remove mostly NAs cols
+all(colSums(is.na(training_set))==0)          # check no NA values left
+training_set <- training_set[,-c(1:7)]        # removing timestamp and user related cols
+nearZeroVar(training_set, saveMetrics=1)      # checking no useless variables left
+# having a look a our final tidy dataset
+#summary(training_set)  # commented to save space
+```
+A final look at our tidy dataset reassure us _(all variables are usable and we even have a nice balanced distribution of outcome classes)_ that we can start the real work!  
+We will skip the EDA phase (no nice plots thie time sorry) as there are so many complex predictors ; we can directly start with advanced modeling.
+
+
+---
+
+# Training Models
+
+## Splitting data for Cross-Validation
+As we have no hints from EDA about which complex model apply, we should try training several models and compare them.  
+Let's use cross validation and sub-split the training data set into training and testing and validation sets _(80%-20%-20%)_.
+```{r split-cv}
+inBuild    <- createDataPartition(training_set$class, p=.8, list=0)
+validation <- training_set[-inBuild,] 
+inTrain    <- createDataPartition(training_set[inBuild,] $class, p=.75, list=0)
+training   <- training_set[inBuild,][inTrain,] ; testing <- training_set[inBuild,][-inTrain,]
+# check splits repartition
+cbind(training_set=dim(training_set), validation=dim(validation), training=dim(training), testing=dim(testing))
+```
+
+## 1st model: Linear Discriminant Analysis _(lda)_
+Let's start by a straight forward model, LDA. But first, as after cleaning our dataset still have over 50 predictors, we will apply Principal Component to reduce this number ; I have set PCA to preserve 99% variance as the default 95% with 25PCs was not good at all _(intermediate steps hidden to reduce report's length)_
+```{r model-1-pca}
+#modelFit_lda <- train(classe~., data=training, method='lda')  # basic training with all predictors
+preProc_pca   <- preProcess(training[,-53], method='pca', thresh=.99)  # PCA with 99% variance
+training_pca  <- predict(preProc_pca, training[,-53])
+testing_pca   <- predict(preProc_pca,  testing[,-53])
+```
+We can now train our lda model on the train set and use it to predict outcome on the testing set...
+```{r model-1-lda}
+modelFit_lda  <- train(y=training$classe, x=training_pca, method='lda')
+eval_lda      <- confusionMatrix(testing$classe, predict(modelFit_lda, testing_pca))
+eval_lda
+```
+It seems that our model is not execptionnal with an accuracy of around `r round(eval_lda$overall["Accuracy"]*100)`% and an out-of-sample error _(1-accuracy)_ of `r round(1 - eval_lda$overall["Accuracy"], 2)`.
+
+
+## 2nd model: Decision Tree
+Let's see how a decision tree would do... _(using parallel processing in order not to wait hours on my old computer)_
+```{r model-2-tree}
+cluster <- makeCluster(detectCores(-1))       # leaving 1 cluster for os
+registerDoParallel(cluster)                   # config parallel processing cluster 
+fitControl <- trainControl(allowParallel=1)   # configure caret::trainControl
+modelFit_rpart <- train(classe~., data=training, method='rpart', trControl=fitControl) #na.action=na.roughfix
+stopCluster(cluster) ; registerDoSEQ()        # shutoff parallel cluster
+eval_rpart <- confusionMatrix(testing$classe, predict(modelFit_rpart, testing))
+eval_rpart$overall
+```
+It reveals not to be better than our LDA (accuracy: `r round(eval_rpart$overall["Accuracy"]*100)`% / out-of-sample error: `r round(1 - eval_rpart$overall["Accuracy"], 2)`).  
+We will have to keep trying...
+
+## 3rd model: Random Forest
+Still using parallel computing, we can now try random forest hoping for it to be better _(let's cross fingers as I am running out of ideas...)_
+```{r model-3-forest}
+cluster <- makeCluster(detectCores(-1))       # leaving 1 cluster for os
+registerDoParallel(cluster)                   # config parallel processing cluster 
+fitControl  <- trainControl(allowParallel=1)  # configure caret::trainControl
+modelFit_rf  <- train(classe~., data=training, method='rf', trControl=fitControl)
+stopCluster(cluster) ; registerDoSEQ()        # shutoff parallel cluster
+eval_rf <- confusionMatrix(testing$classe, predict(modelFit_rf, testing))
+eval_rf
+```
+We can say that this model performs amazingly with an accury over `r round(eval_rf$overall["Accuracy"]*100,2)`% (ie. out-of-sample error = `r round(1 - eval_rf$overall["Accuracy"], 3)`).
+
+---
+
+# Validation of our best model
+We can now use our validation dataset to confirm our results and elect our random forest as our champion...
+Let's first make it predict outcomes for the validation set...
+```{r validation-predictions}
+predictions <- predict(modelFit_rf, validation)
+```
+We can this time print the full confusion matrix to admire our results:
+```{r validation-results}
+confusionMatrix(validation$classe, predictions)
+```
+
+
+---
+
+# Conclusion
+Our **random forest model** performed very very well on our validation set with similar results as on the test set _(99% accuracy)_.  
+We can be optimist that it will correclty predict the second part of the assignement.
